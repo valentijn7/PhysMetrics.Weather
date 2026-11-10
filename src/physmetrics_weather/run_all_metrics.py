@@ -14,7 +14,7 @@ Ensemble / Probabilistic Model Support:
     'ensemble', 'number') in input datasets. Evaluates metrics for each ensemble
     member individually and labels output rows with the corresponding `ensemble_member`
     identifier (defaulting to 0 for deterministic models).
-            
+
 Usage:
     physmetrics-run --year 2020
     physmetrics-run --dates 2020-01-01 2020-01-02 --workers 4
@@ -158,7 +158,11 @@ def open_zarr_anonymous(url: str) -> xr.Dataset:
     Returns:
         Cleaned xarray Dataset with normalized variable names.
     """
-    ds = xr.open_zarr(url, storage_options={"token": "anon"})
+    # cloud storage needs anonymous access, local files must not get this option
+    if str(url).startswith(("gs://", "gcs://")):
+        ds = xr.open_zarr(url, storage_options = {"token": "anon"})
+    else:
+        ds = xr.open_zarr(url)
     rename = {}
     for v in ds.data_vars:
         if v != v.strip():
@@ -705,7 +709,7 @@ def _evaluate_one(
                     ds_pred_window[t_name_for_nan].isel({model_level_dim_d: 0, "latitude": 0, "longitude": 0}, drop=True),
                     np.nan
                 )
-                
+
                 try:
                     dry, water, energy = compute_conservation_scalars(
                         ds_pred_window, ps_pred_window, area_model, z_sfc=z_sfc_model, level_dim=model_level_dim_d
@@ -713,17 +717,17 @@ def _evaluate_one(
                 except (ValueError, KeyError, AttributeError):
                     dry, water, energy = nan_arr, nan_arr, nan_arr
                     step_sp_method = "failed"
-                    
+
                 try:
                     hydro = compute_hydrostatic_imbalance(ds_pred_window, area_model, level_dim=model_level_dim_d)
                 except (ValueError, KeyError, AttributeError):
                     hydro = nan_arr
-                    
+
                 try:
                     geo = compute_geostrophic_imbalance(ds_pred_window, area_model, level_dim=model_level_dim_d)
                 except (ValueError, KeyError, AttributeError):
                     geo = nan_arr
-                    
+
                 ds_metrics = xr.Dataset({
                     "dry_mass_Eg": dry,
                     "water_mass_kg": water,
@@ -731,25 +735,25 @@ def _evaluate_one(
                     "hydrostatic_rmse": hydro,
                     "geostrophic_rmse": geo,
                 })
-                
+
                 ds_metrics = ds_metrics.compute()
                 df_metrics = ds_metrics.to_dataframe().reset_index()
-                
+
                 for m in ens_members:
                     if ens_dim and ens_dim in df_metrics.columns:
                         df_m = df_metrics[df_metrics[ens_dim] == m].copy()
                     else:
                         df_m = df_metrics.copy()
-                        
+
                     df_m = df_m.sort_values(pred_td_dim)
-                    
+
                     hours_model = np.array([float(td / np.timedelta64(1, "h")) for td in df_m[pred_td_dim].values])
                     dry_vals = df_m["dry_mass_Eg"].values
                     water_vals = df_m["water_mass_kg"].values
                     energy_vals = df_m["total_energy_J"].values
                     hydro_vals = df_m["hydrostatic_rmse"].values
                     geo_vals = df_m["geostrophic_rmse"].values
-                    
+
                     for i, h in enumerate(hours_model):
                         ts_rows.append({
                             "date": date_str,
@@ -762,7 +766,7 @@ def _evaluate_one(
                             "sp_method": step_sp_method,
                             "ensemble_member": m,
                         })
-                        
+
                     ref_hydro, ref_geo = None, None
                     if ds_ref_t is not None:
                         ref_ld = _detect_level_dim(ds_ref_t)
@@ -774,7 +778,7 @@ def _evaluate_one(
                             ref_geo = float(compute_geostrophic_imbalance(ds_ref_t, area, level_dim=ref_ld))
                         except (ValueError, KeyError, AttributeError):
                             pass
-                            
+
                     if len(hydro_vals) > 0:
                         _append_summary("hydrostatic_rmse", float(hydro_vals[-1]), ref_hydro, ens_member=m)
                         _append_summary("geostrophic_rmse", float(geo_vals[-1]), ref_geo, ens_member=m)
@@ -835,17 +839,17 @@ def _evaluate_one(
                     )
                     for band_key, w1_val in lr_results.items():
                         _append_summary(band_key, w1_val, None, ens_member=m)
-                    
+
                     # --- Lapse Rate Distribution ---
                     # Calculate Gamma explicitly
                     t_name_p = _find_var(ds_model_m, T_NAMES)
                     phi_name_p = _find_var(ds_model_m, PHI_NAMES)
                     t_name_r = _find_var(ds_ref_aligned, T_NAMES)
                     phi_name_r = _find_var(ds_ref_aligned, PHI_NAMES)
-                    
+
                     ld_p = _detect_level_dim(ds_model_m)
                     ld_r = _detect_level_dim(ds_ref_aligned)
-                    
+
                     def _get_gamma(ds, t_var, phi_var, ld, p_top=500.0, p_bot=850.0):
                         levels = ds[ld].values
                         idx_top = int(np.abs(levels - p_top).argmin())
@@ -879,7 +883,7 @@ def _evaluate_one(
                             if len(g_pred_vals) > 0 and len(g_ref_vals) > 0:
                                 hist_pred, _ = np.histogram(g_pred_vals, bins=bins, density=True)
                                 hist_ref, _ = np.histogram(g_ref_vals, bins=bins, density=True)
-                                
+
                                 for bi, b_val in enumerate(bins[:-1]):
                                     lr_dist_rows.append({
                                         "date": date_str,
@@ -893,7 +897,7 @@ def _evaluate_one(
                 except (ValueError, KeyError, AttributeError) as exc:
                     if "Distribution can't be empty" not in str(exc):
                         _log(f"    [{counter}] Lapse rate evaluation failed for member {m}: {exc}")
-                    
+
                     lr_results = {
                         "lapse_rate_wasserstein_nh_mid": np.nan,
                         "lapse_rate_wasserstein_sh_mid": np.nan,
