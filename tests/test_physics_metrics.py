@@ -145,12 +145,15 @@ def test_integrate_column(mock_grid_coords):
     """Test 3D column integration helper."""
     lats, lons, levels = mock_grid_coords
     nlat, nlon, nlev = len(lats), len(lons), len(levels)
-    field_3d = np.ones((nlev, nlat, nlon))
-    ps_2d = np.full((nlat, nlon), 100000.0)
+    field_3d = xr.DataArray(
+        np.ones((nlev, nlat, nlon)), dims=("level", "latitude", "longitude"),
+        coords={"level": levels, "latitude": lats, "longitude": lons},
+    )
+    ps_2d = xr.full_like(field_3d.isel(level=0, drop=True), 100000.0)
 
     integrated = _integrate_column(field_3d, levels, ps_2d)
-    assert integrated.shape == (nlat, nlon)
-    assert (integrated > 0).all()
+    assert integrated.dims == ("latitude", "longitude")
+    np.testing.assert_allclose(integrated, 100000.0 / 9.80665)
 
 
 def test_compute_dry_air_mass_deterministic(mock_deterministic_ds):
@@ -184,18 +187,26 @@ def test_one_exagram_of_dry_air():
     assert mass.attrs["units"] == "Eg"
 
 
+def _check_member_metric(single, ensemble):
+    assert isinstance(single, xr.DataArray)
+    assert single.dims == ()
+    assert isinstance(ensemble, xr.DataArray)
+    assert ensemble.dims == ("ens",)
+    np.testing.assert_array_equal(ensemble.ens, [0, 1, 2])
+    assert np.isfinite(ensemble).all()
+    # member zero is identical to the deterministic fixture
+    np.testing.assert_allclose(ensemble.sel(ens=0), single)
+
+
 def test_compute_water_mass(mock_deterministic_ds, mock_ensemble_ds):
     """Test global water mass calculation for deterministic and ensemble datasets."""
     area = get_grid_cell_area(mock_deterministic_ds)
     ps = mock_deterministic_ds["surface_pressure"]
 
     water_det = compute_water_mass(mock_deterministic_ds, ps, area)
-    assert isinstance(water_det, float)
-    assert water_det > 0
-
     water_ens = compute_water_mass(mock_ensemble_ds, mock_ensemble_ds["surface_pressure"], area)
-    assert isinstance(water_ens, dict)
-    assert len(water_ens) == 3
+    _check_member_metric(water_det, water_ens)
+    assert (water_ens > 0).all()
 
 
 def test_compute_total_energy(mock_deterministic_ds, mock_static_ds, mock_ensemble_ds):
@@ -205,14 +216,11 @@ def test_compute_total_energy(mock_deterministic_ds, mock_static_ds, mock_ensemb
     z_sfc = mock_static_ds["geopotential_at_surface"]
 
     te_det = compute_total_energy(mock_deterministic_ds, ps, area, z_sfc=z_sfc)
-    assert isinstance(te_det, float)
-    assert te_det > 0
-
     te_ens = compute_total_energy(
         mock_ensemble_ds, mock_ensemble_ds["surface_pressure"], area, z_sfc=z_sfc
     )
-    assert isinstance(te_ens, dict)
-    assert len(te_ens) == 3
+    _check_member_metric(te_det, te_ens)
+    assert (te_ens > 0).all()
 
 
 def test_compute_ke_spectrum(mock_deterministic_ds, mock_ensemble_ds):
@@ -254,12 +262,9 @@ def test_compute_hydrostatic_imbalance(mock_deterministic_ds, mock_ensemble_ds):
     area = get_grid_cell_area(mock_deterministic_ds)
 
     hydro_det = compute_hydrostatic_imbalance(mock_deterministic_ds, area)
-    assert isinstance(hydro_det, float)
-    assert hydro_det >= 0
-
     hydro_ens = compute_hydrostatic_imbalance(mock_ensemble_ds, area)
-    assert isinstance(hydro_ens, dict)
-    assert len(hydro_ens) == 3
+    _check_member_metric(hydro_det, hydro_ens)
+    assert (hydro_ens >= 0).all()
 
 
 def test_compute_geostrophic_imbalance(mock_deterministic_ds, mock_ensemble_ds):
@@ -267,11 +272,9 @@ def test_compute_geostrophic_imbalance(mock_deterministic_ds, mock_ensemble_ds):
     area = get_grid_cell_area(mock_deterministic_ds)
 
     geo_det = compute_geostrophic_imbalance(mock_deterministic_ds, area)
-    assert isinstance(geo_det, float)
-
     geo_ens = compute_geostrophic_imbalance(mock_ensemble_ds, area)
-    assert isinstance(geo_ens, dict)
-    assert len(geo_ens) == 3
+    _check_member_metric(geo_det, geo_ens)
+    assert (geo_ens >= 0).all()
 
 
 def test_compute_lapse_rate_wasserstein(mock_deterministic_ds):
@@ -311,8 +314,16 @@ def test_compute_conservation_scalars(mock_deterministic_ds, mock_static_ds, moc
     scalars_ens = compute_conservation_scalars(
         mock_ensemble_ds, mock_ensemble_ds["surface_pressure"], area, z_sfc=z_sfc
     )
-    assert isinstance(scalars_ens, dict)
+    assert isinstance(scalars_ens, tuple)
     assert len(scalars_ens) == 3
+    for single, ensemble in zip(scalars_det, scalars_ens):
+        _check_member_metric(single, ensemble)
+    for member in mock_ensemble_ds.ens.values:
+        ds = mock_ensemble_ds.sel(ens=member, drop=True)
+        expected = compute_conservation_scalars(ds, ds.surface_pressure, area, z_sfc)
+        for ensemble, single in zip(scalars_ens, expected):
+            np.testing.assert_allclose(ensemble.sel(ens=member), single)
+
 
 
 def test_compute_pure_tcwv(mock_deterministic_ds):
