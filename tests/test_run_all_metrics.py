@@ -5,6 +5,8 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from physmetrics_weather import run_all_metrics as runner
+
 from physmetrics_weather.run_all_metrics import (
     _align_ref_to_model,
     _grids_match,
@@ -66,3 +68,42 @@ def test_align_ref_to_model():
 
     aligned = _align_ref_to_model(ds_ref, ds_mod)
     assert aligned.sizes["latitude"] == 32
+
+
+@pytest.mark.parametrize("missing_reference", [False, True])
+def test_cli_matches_reference_budget_trends(monkeypatch, missing_reference):
+    init = np.datetime64("2020-01-01", "ns")
+    leads = np.array([12, 24], dtype="timedelta64[h]")
+    ref = xr.Dataset(coords={
+        "time": init + leads, "level": [500, 850],
+        "latitude": [-60., 0., 60.], "longitude": [0., 90., 180., 270.],
+    })
+    dims = ("time", "level", "latitude", "longitude")
+    state = {"t": 280., "q": 0.01, "z": 0., "u": 0., "v": 0.}
+    for name, value in state.items():
+        ref[name] = (dims, np.full((2, 2, 3, 4), value))
+    ref["surface_pressure"] = xr.ones_like(ref.t.isel(level=0, drop=True)) * 1e5
+    ref["surface_pressure"][1] = 101000.
+    surface = ref.z.isel(time=0, level=0, drop=True)
+    ref["geopotential_at_surface"] = xr.zeros_like(surface)
+    pred = ref.drop_vars("geopotential_at_surface")
+    pred = pred.rename(time="prediction_timedelta")
+    pred = pred.assign_coords(prediction_timedelta=leads).expand_dims(time=[init])
+    members = xr.IndexVariable("ens", [0, 1])
+    pred = xr.concat([pred, pred], dim=members, data_vars="all")
+    pred["surface_pressure"][1] = 100000.
+    if missing_reference:
+        ref = ref.isel(time=[1])
+    stores = {"pred": pred, "ref": ref}
+    monkeypatch.setattr(runner, "open_zarr_anonymous", stores.__getitem__)
+    monkeypatch.setattr(runner, "_align_ref_to_model", lambda *args: None)
+    rows, *_ = runner._evaluate_one(
+        "pred", "ref", "2020-01-01", "24h", leads[-1], 1, 1, "joint", False
+    )
+    for name in ("water_mass_drift_pct_per_day", "total_energy_drift_pct_per_day"):
+        values = [r["model_value"] for r in rows if r["metric_name"] == name]
+        assert len(values) == 2
+        if missing_reference:
+            assert np.isnan(values).all()
+        else:
+            np.testing.assert_allclose(values, [0., -2.], atol=1e-9)

@@ -54,6 +54,7 @@ from physmetrics_weather.physics_metrics import (
     _find_effective_resolution,
     _find_var,
     compute_conservation_scalars,
+    compute_drift_percentages,
     compute_drift_slope,
     compute_geostrophic_imbalance,
     compute_hydrostatic_imbalance,
@@ -739,6 +740,24 @@ def _evaluate_one(
                 ds_metrics = ds_metrics.compute()
                 df_metrics = ds_metrics.to_dataframe().reset_index()
 
+                # all members share one reference budget time series
+                leads = np.sort(avail_tds)
+                hours_ref = leads / np.timedelta64(1, "h")
+                ref_water = ref_energy = np.full(leads.shape, np.nan)
+                try:
+                    ref = ds_ref_full.sel(time=init_time + leads)
+                    ref = ref.chunk({"time": 1})
+                    ps = _get_ps(ref, ds_static, level_dim=ref_level_dim)
+                    _, water, energy = compute_conservation_scalars(
+                        ref, ps, area, z_sfc=z_sfc, level_dim=ref_level_dim
+                    )
+                    budgets = xr.Dataset({"water": water, "energy": energy})
+                    budgets = budgets.transpose("time").compute()
+                    ref_water = budgets.water.values
+                    ref_energy = budgets.energy.values
+                except (ValueError, KeyError, AttributeError) as exc:
+                    _log(f"    [{counter}] Reference drift unavailable: {exc}")
+
                 for m in ens_members:
                     if ens_dim and ens_dim in df_metrics.columns:
                         df_m = df_metrics[df_metrics[ens_dim] == m].copy()
@@ -783,34 +802,30 @@ def _evaluate_one(
                         _append_summary("hydrostatic_rmse", float(hydro_vals[-1]), ref_hydro, ens_member=m)
                         _append_summary("geostrophic_rmse", float(geo_vals[-1]), ref_geo, ens_member=m)
 
-                    slope_dry = compute_drift_slope(hours_model, dry_vals)
-                    slope_water = compute_drift_slope(hours_model, water_vals)
-                    slope_energy = compute_drift_slope(hours_model, energy_vals)
-
+                    if not np.array_equal(hours_model, hours_ref):
+                        raise ValueError("Forecast/reference drift leads differ")
+                    rates = compute_drift_percentages(
+                        hours_model, dry_vals, water_vals, energy_vals,
+                        hours_ref, ref_water, ref_energy,
+                    )
+                    # preserve the CLI baseline if early dry masses are missing
                     valid_dry = dry_vals[np.isfinite(dry_vals)]
-                    dry_ref = float(valid_dry[0]) if len(valid_dry) > 0 else 0.0
-
-                    valid_water = water_vals[np.isfinite(water_vals)]
-                    water_ref = float(valid_water[0]) if len(valid_water) > 0 else 0.0
-
-                    valid_energy = energy_vals[np.isfinite(energy_vals)]
-                    energy_ref = float(valid_energy[0]) if len(valid_energy) > 0 else 0.0
-
-                    _append_summary(
-                        "dry_mass_drift_pct_per_day",
-                        (slope_dry / dry_ref * 100.0) if dry_ref != 0 and np.isfinite(slope_dry) else float("nan"),
-                        ens_member=m,
-                    )
-                    _append_summary(
-                        "water_mass_drift_pct_per_day",
-                        (slope_water / water_ref * 100.0) if water_ref != 0 and np.isfinite(slope_water) else float("nan"),
-                        ens_member=m,
-                    )
-                    _append_summary(
-                        "total_energy_drift_pct_per_day",
-                        (slope_energy / energy_ref * 100.0) if energy_ref != 0 and np.isfinite(slope_energy) else float("nan"),
-                        ens_member=m,
-                    )
+                    if not np.isfinite(dry_vals[0]) and valid_dry.size:
+                        baseline = valid_dry[0]
+                        slope = compute_drift_slope(hours_model, dry_vals)
+                        if baseline != 0:
+                            rates["dry_mass_drift_pct_per_day"] = 100 * slope / baseline
+                    # noth slopes must cover the same samples
+                    for name, model_values, ref_values in (
+                        ("water_mass_drift_pct_per_day", water_vals, ref_water),
+                        ("total_energy_drift_pct_per_day", energy_vals, ref_energy),
+                    ):
+                        if not np.isfinite(model_values).all() or (
+                            not np.isfinite(ref_values).all()
+                        ):
+                            rates[name] = np.nan
+                    for name, rate in rates.items():
+                        _append_summary(name, rate, ens_member=m)
         except (ValueError, KeyError, AttributeError) as exc:
             _log(f"    [{counter}] Drift metrics failed: {exc}")
 
