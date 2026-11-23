@@ -159,8 +159,9 @@ def test_compute_dry_air_mass_deterministic(mock_deterministic_ds):
     ps = mock_deterministic_ds["surface_pressure"]
 
     dry_mass = compute_dry_air_mass(mock_deterministic_ds, ps, area)
-    assert isinstance(dry_mass, float)
-    assert 4.0 < dry_mass < 6.0  # Earth dry air mass ≈ 5.1 Eg
+    assert dry_mass.dims == ()
+    assert dry_mass.attrs["units"] == "Eg"
+    assert 4000 < dry_mass.item() < 6000
 
 
 def test_compute_dry_air_mass_ensemble(mock_ensemble_ds):
@@ -169,11 +170,18 @@ def test_compute_dry_air_mass_ensemble(mock_ensemble_ds):
     ps = mock_ensemble_ds["surface_pressure"]
 
     dry_mass = compute_dry_air_mass(mock_ensemble_ds, ps, area)
-    assert isinstance(dry_mass, dict)
-    assert len(dry_mass) == 3
-    for m, val in dry_mass.items():
-        assert isinstance(val, float)
-        assert 4.0 < val < 6.0
+    assert dry_mass.dims == ("ens",)
+    np.testing.assert_array_equal(dry_mass.ens, [0, 1, 2])
+    assert np.all((dry_mass > 4000) & (dry_mass < 6000))
+
+
+def test_one_exagram_of_dry_air():
+    # 10000 kg/m^2 on one cell of 10^11 m^2 gives exactly one exagram
+    ps = xr.DataArray([[98066.5]], dims=("latitude", "longitude"))
+    area = xr.full_like(ps, 1e11)
+    mass = compute_dry_air_mass(xr.Dataset(), ps, area, tcwv=xr.zeros_like(ps))
+    assert mass.item() == pytest.approx(1.0)
+    assert mass.attrs["units"] == "Eg"
 
 
 def test_compute_water_mass(mock_deterministic_ds, mock_ensemble_ds):

@@ -49,7 +49,7 @@ L_V: float = 2.501e6               # J/kg  – latent heat of vaporisation (at 0
 R_DRY: float = 287.05              # J/(kg·K) – specific gas constant, dry air
 LAPSE_RATE: float = 0.0065         # K/m   – standard tropospheric lapse rate
 OMEGA: float = 7.2921e-5           # rad/s – Earth angular velocity
-EXAGRAM: float = 1e18              # kg    – conversion factor to Exagrams
+EXAGRAM: float = 1e15              # kg per exagram -- conversion factor
 R_V: float = 461.5                 # J/(kg·K) – specific gas constant, water vapor
 
 
@@ -333,29 +333,29 @@ def _integrate_column(
     p = xr.DataArray(levels_pa[sort_idx], dims=[level_dim], coords={level_dim: levels_pa[sort_idx]})
     f = field.isel({level_dim: sort_idx})
     f = f.assign_coords({level_dim: p})
-    
+
     p_top = p.isel({level_dim: slice(0, -1)})
     p_bot = p.isel({level_dim: slice(1, None)})
     p_bot = p_bot.assign_coords({level_dim: p_top[level_dim]})
-    
+
     f_top = f.isel({level_dim: slice(0, -1)})
     f_bot = f.isel({level_dim: slice(1, None)})
     f_bot = f_bot.assign_coords({level_dim: p_top[level_dim]})
-    
+
     f_avg = 0.5 * (f_top + f_bot)
-    
+
     eff_top = xr.where(ps < p_top, ps, p_top)
     eff_bot = xr.where(ps < p_bot, ps, p_bot)
     dp = xr.where((eff_bot - eff_top) > 0, eff_bot - eff_top, 0.0)
-    
+
     col = (f_avg * dp).sum(dim=level_dim)
-    
+
     dp_top = xr.where(ps < p[0], ps, p[0]) - 0.0
     col += f.isel({level_dim: 0}).drop_vars(level_dim) * dp_top
-    
+
     dp_bot = xr.where(ps > p[-1], ps - p[-1], 0.0)
     col += f.isel({level_dim: -1}).drop_vars(level_dim) * dp_bot
-    
+
     return col / gravity
 
 
@@ -435,10 +435,11 @@ def compute_dry_air_mass(
     col_dry = ps / GRAVITY - tcwv
     lat_dim = [d for d in col_dry.dims if "lat" in d.lower()][0]
     lon_dim = [d for d in col_dry.dims if "lon" in d.lower()][0]
-    
+
     area_aligned = xr.DataArray(area.values, dims=[lat_dim, lon_dim], coords={lat_dim: col_dry[lat_dim], lon_dim: col_dry[lon_dim]})
     dry_mass_kg = (area_aligned * col_dry).sum(dim=[lat_dim, lon_dim], skipna=True, min_count=1)
-    return dry_mass_kg / EXAGRAM
+    mass = dry_mass_kg / EXAGRAM
+    return mass.assign_attrs(units="Eg", long_name="Global dry air mass")
 
 
 
@@ -459,7 +460,7 @@ def compute_water_mass(
         tcwv = _compute_tcwv(ds, ps, q_name=q_name, level_dim=level_dim, levels=levels)
     lat_dim = [d for d in tcwv.dims if "lat" in d.lower()][0]
     lon_dim = [d for d in tcwv.dims if "lon" in d.lower()][0]
-    
+
     area_aligned = xr.DataArray(area.values, dims=[lat_dim, lon_dim], coords={lat_dim: tcwv[lat_dim], lon_dim: tcwv[lon_dim]})
     return (area_aligned * tcwv).sum(dim=[lat_dim, lon_dim], skipna=True, min_count=1)
 
@@ -494,23 +495,23 @@ def compute_total_energy(
     ref_var = ds[t_var]
     lat_dim_ = [d for d in ref_var.dims if "lat" in d.lower()][0]
     lon_dim_ = [d for d in ref_var.dims if "lon" in d.lower()][0]
-    
+
     lat_diff = abs(z_sfc.sizes[lat_dim_] - ref_var.sizes[lat_dim_])
     lon_diff = abs(z_sfc.sizes[lon_dim_] - ref_var.sizes[lon_dim_])
     if lat_diff <= 1 and lon_diff == 0:
         z_aligned = z_sfc.reindex({lat_dim_: ref_var[lat_dim_], lon_dim_: ref_var[lon_dim_]}, method="nearest")
     else:
         raise ValueError(f"Grid mismatch too large: z_sfc={z_sfc.shape}, model={ref_var.shape}.")
-        
+
     u_var = DatasetValidator.require_variable(ds, u_names, "Zonal Wind (u)")
     v_var = DatasetValidator.require_variable(ds, v_names, "Meridional Wind (v)")
     u_val = ds[u_var]
     v_val = ds[v_var]
     wspd_sq = u_val**2 + v_val**2
-    
+
     energy_density = c_p * T + z_aligned + l_v * q + 0.5 * wspd_sq
     col_energy = _integrate_column(energy_density, levels, ps, level_dim=level_dim)
-    
+
     area_aligned = xr.DataArray(area.values, dims=[lat_dim_, lon_dim_], coords={lat_dim_: col_energy[lat_dim_], lon_dim_: col_energy[lon_dim_]})
     return (area_aligned * col_energy).sum(dim=[lat_dim_, lon_dim_], skipna=True, min_count=1)
 
@@ -538,7 +539,7 @@ def _ke_spectrum_spharm(
     """
     u = np.asarray(u, dtype=np.float64).squeeze()
     v = np.asarray(v, dtype=np.float64).squeeze()
-    
+
     u = np.nan_to_num(u, nan=0.0)
     v = np.nan_to_num(v, nan=0.0)
 
@@ -919,16 +920,16 @@ def compute_hydrostatic_imbalance(
     phi_var = phi_name or DatasetValidator.require_variable(ds, PHI_NAMES, "Geopotential")
     t_var = t_name or DatasetValidator.require_variable(ds, T_NAMES, "Temperature")
     q_var = q_name if q_name in ds.data_vars else _find_var(ds, Q_NAMES)
-    
+
     def _sel_level(var: str, p: float) -> xr.DataArray:
         idx = int(np.abs(levels - p).argmin())
         return ds[var].isel({level_dim: idx}).drop_vars(level_dim, errors="ignore")
-        
+
     phi_top = _sel_level(phi_var, p_top)
     phi_bot = _sel_level(phi_var, p_bot)
     T_top = _sel_level(t_var, p_top)
     T_bot = _sel_level(t_var, p_bot)
-    
+
     if q_var is not None and q_var in ds.data_vars:
         q_top = _sel_level(q_var, p_top)
         q_bot = _sel_level(q_var, p_bot)
@@ -937,17 +938,17 @@ def compute_hydrostatic_imbalance(
     else:
         Tv_top = T_top
         Tv_bot = T_bot
-        
+
     Tv_mean = 0.5 * (Tv_top + Tv_bot)
     lhs = phi_top - phi_bot
     rhs = r_dry * Tv_mean * np.log(p_bot / p_top)
     error = lhs - rhs
-    
+
     lat_dim_e = next((d for d in error.dims if "lat" in d.lower()), None)
     lon_dim_e = next((d for d in error.dims if "lon" in d.lower()), None)
     if lat_dim_e and lon_dim_e and list(error.dims)[-2:] != [lat_dim_e, lon_dim_e]:
         error = error.transpose(..., lat_dim_e, lon_dim_e)
-        
+
     area_aligned = xr.DataArray(area.values, dims=[lat_dim_e, lon_dim_e], coords={lat_dim_e: error[lat_dim_e], lon_dim_e: error[lon_dim_e]})
     weights = area_aligned / area_aligned.sum(dim=[lat_dim_e, lon_dim_e])
     mse = (weights * error**2).sum(dim=[lat_dim_e, lon_dim_e], skipna=True, min_count=1)
@@ -977,12 +978,12 @@ def compute_geostrophic_imbalance(
         level_dim = _detect_level_dim(ds)
     levels = ds[level_dim].values
     idx = int(np.abs(levels - level).argmin())
-    
+
     phi_var = phi_name if phi_name in ds.data_vars else DatasetValidator.require_variable(ds, PHI_NAMES, "Geopotential")
     phi = ds[phi_var]
     if level_dim in phi.dims:
         phi = phi.isel({level_dim: idx}).drop_vars(level_dim, errors="ignore")
-        
+
     u_var = DatasetValidator.require_variable(ds, u_names, "Zonal Wind (u)")
     v_var = DatasetValidator.require_variable(ds, v_names, "Meridional Wind (v)")
     u_actual = ds[u_var]
@@ -990,27 +991,27 @@ def compute_geostrophic_imbalance(
     if level_dim in u_actual.dims:
         u_actual = u_actual.isel({level_dim: idx}).drop_vars(level_dim, errors="ignore")
         v_actual = v_actual.isel({level_dim: idx}).drop_vars(level_dim, errors="ignore")
-        
+
     if lat_name in phi.dims and lon_name in phi.dims:
         if list(phi.dims)[-2:] != [lat_name, lon_name]:
             phi = phi.transpose(..., lat_name, lon_name)
             u_actual = u_actual.transpose(..., lat_name, lon_name)
             v_actual = v_actual.transpose(..., lat_name, lon_name)
-            
+
     lat = ds[lat_name]
     lon = ds[lon_name]
     lat_rad = np.deg2rad(lat)
     lon_rad = np.deg2rad(lon)
-    
+
     f = 2.0 * omega * np.sin(lat_rad)
     cos_lat = np.cos(lat_rad)
-    
+
     f_safe = xr.where(f == 0.0, 1e-10, f)
     cos_lat_safe = xr.where(cos_lat == 0.0, 1e-10, cos_lat)
 
     phi = phi.chunk({lat_name: -1, lon_name: -1})
     dPhi_dphi = phi.differentiate(lat_name) * (180.0 / np.pi)
-    
+
     phi_east = phi.shift({lon_name: -1})
     phi_west = phi.shift({lon_name: 1})
 
@@ -1018,22 +1019,22 @@ def compute_geostrophic_imbalance(
     phi_west = xr.where(phi_west.isnull(), phi.isel({lon_name: -1}), phi_west)
     dlon_rad = np.deg2rad(np.abs(lon.values[1] - lon.values[0]))
     dPhi_dlam = (phi_east - phi_west) / (2.0 * dlon_rad)
-    
+
     u_g = -dPhi_dphi / (f_safe * earth_radius)
     v_g = dPhi_dlam / (f_safe * earth_radius * cos_lat_safe)
-    
+
     du = u_actual - u_g
     dv = v_actual - v_g
     vec_err_sq = du**2 + dv**2
-    
+
     lat_mask = (np.abs(lat) >= lat_cutoff) & (np.abs(lat) < 89.9)
     vec_err_sq = xr.where(lat_mask, vec_err_sq.fillna(0.0), 0.0)
-    
+
     area_aligned = xr.DataArray(area.values, dims=[lat_name, lon_name], coords={lat_name: ds[lat_name], lon_name: ds[lon_name]})
     w = xr.where(lat_mask, area_aligned, 0.0)
     w_sum = w.sum(dim=[lat_name, lon_name])
     w_norm = w / w_sum
-    
+
     mse = (w_norm * vec_err_sq).sum(dim=[lat_name, lon_name], skipna=True, min_count=1)
     return mse ** 0.5
 
@@ -1248,24 +1249,24 @@ def compute_pure_tcwv(
     q = ds[q_name]
     levels = ds[level_dim].values
     levels_pa = levels.astype(np.float64) * 100.0
-    
+
     sort_idx = np.argsort(levels_pa)
     p = xr.DataArray(levels_pa[sort_idx], dims=[level_dim], coords={level_dim: levels_pa[sort_idx]})
     q_sorted = q.isel({level_dim: sort_idx}).assign_coords({level_dim: p})
-    
+
     p_top = p.isel({level_dim: slice(0, -1)})
     p_bot = p.isel({level_dim: slice(1, None)})
     p_bot = p_bot.assign_coords({level_dim: p_top[level_dim]})
-    
+
     q_top = q_sorted.isel({level_dim: slice(0, -1)})
     q_bot = q_sorted.isel({level_dim: slice(1, None)})
     q_bot = q_bot.assign_coords({level_dim: p_top[level_dim]})
-    
+
     q_avg = 0.5 * (q_top + q_bot)
     dp = p_bot - p_top
-    
+
     col = (q_avg * dp).sum(dim=level_dim)
-    
+
     col.name = "tcwv_pure"
     col.attrs = {
         "units": "kg/m²",
