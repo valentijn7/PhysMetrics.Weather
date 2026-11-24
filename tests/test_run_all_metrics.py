@@ -139,3 +139,16 @@ def test_balance_summary_pairs_12h_forecast_with_12h_reference(monkeypatch):
         assert actual == {(12, 0): (100000., 100000.), (12, 1): (100200., 100000.)}
         assert any(row["forecast_hour"] == 24 and row[metric] == 101000.
                    for row in series)
+
+
+def test_single_lead_emits_balance_and_budgets_without_drift(monkeypatch):
+    pred, ref, leads = _two_lead_datasets()
+    stores = {"pred": pred.isel(prediction_timedelta=[0]), "ref": ref.isel(time=[0])}
+    monkeypatch.setattr(runner, "open_zarr_anonymous", stores.__getitem__)
+    monkeypatch.setattr(runner, "_align_ref_to_model", lambda *args: None)
+    rows, series, *_ = runner._evaluate_one(
+        "pred", "ref", "2020-01-01", "12h", leads[0], 1, 1, "joint", False
+    )
+    assert {r["metric_name"] for r in rows} == {"hydrostatic_rmse", "geostrophic_rmse"}
+    assert {(r["forecast_hour"], r["ensemble_member"]) for r in series} == {(12, 0), (12, 1)}
+    assert all(np.isfinite(r["dry_mass_Eg"]) for r in series)

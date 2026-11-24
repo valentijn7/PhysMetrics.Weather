@@ -691,7 +691,11 @@ def _evaluate_one(
             ds_pred_window = ds_pred_init.sel({pred_td_dim: slice(td_start, td_end)})
 
             avail_tds = ds_pred_window[pred_td_dim].values
-            if len(avail_tds) >= 2:
+            fit_drift = len(avail_tds) >= 2
+            if not fit_drift:
+                ds_pred_window = ds_pred_init.sel({pred_td_dim: [lead_td]})
+                avail_tds = ds_pred_window[pred_td_dim].values
+            if len(avail_tds):
                 model_level_dim_d = _detect_level_dim(ds_pred_window)
 
                 if not _use_ref_sp:
@@ -807,6 +811,8 @@ def _evaluate_one(
                             "geostrophic_rmse", at_lead["geostrophic_rmse"].item(), ref_geo, ens_member=m
                         )
 
+                    if not fit_drift:
+                        continue
                     if not np.array_equal(hours_model, hours_ref):
                         raise ValueError("Forecast/reference drift leads differ")
                     rates = compute_drift_percentages(
