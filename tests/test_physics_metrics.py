@@ -340,3 +340,54 @@ def test_compute_scalar_spectrum(mock_deterministic_ds):
     assert isinstance(spec, np.ndarray)
     assert len(k) == len(spec)
     assert len(k) > 0
+
+
+def test_gaussian_area_mass_and_balance():
+    """Integrate a constant column and a balanced layer on shuffled rings."""
+    from physmetrics_weather import physics_metrics as pm
+    a = np.degrees(np.arcsin(1 / np.sqrt(3)))
+    order = np.arange(10)[::-1]
+    lat = np.repeat([-a, a], [4, 6])[order]
+    lon = np.r_[np.arange(4) * 90, np.arange(6) * 60][order]
+    ds = xr.Dataset(coords={"latitude": ("point", lat),
+                            "longitude": ("point", lon), "level": [500, 850]})
+    area = pm.get_grid_cell_area(ds)
+    globe = 4 * np.pi * pm.EARTH_RADIUS**2
+    np.testing.assert_allclose(area, np.where(lat < 0, globe / 8, globe / 12))
+    ds["t"] = (("level", "point"), np.full((2, 10), 280.))
+    ds["q"] = xr.zeros_like(ds.t)
+    ds["u"] = ds["v"] = xr.zeros_like(ds.t)
+    thickness = pm.R_DRY * 280 * np.log(850 / 500)
+    ds["z"] = xr.where(ds.level == 500, thickness, 0.) * xr.ones_like(ds.t)
+    ps = xr.full_like(area, 100000.)
+    dry, water, energy = pm.compute_conservation_scalars(ds, ps, area, ps * 0)
+    mass = globe * 100000 / pm.GRAVITY
+    np.testing.assert_allclose(dry, mass / pm.EXAGRAM)
+    np.testing.assert_allclose(water, 0)
+    np.testing.assert_allclose(energy, mass * pm.C_PD * 280)
+    np.testing.assert_allclose(pm.compute_hydrostatic_imbalance(ds, area), 0,
+                               atol=1e-9)
+    ds["z"] = ds.z + 1000 * np.deg2rad(ds.latitude)
+    ds["u"] = xr.ones_like(ds.t) * (
+        -1000 / (2 * pm.OMEGA * np.sin(np.deg2rad(lat)) * pm.EARTH_RADIUS)
+    )
+    np.testing.assert_allclose(pm.compute_geostrophic_imbalance(ds, area),
+                               0, atol=1e-9)
+    with pytest.raises(ValueError, match="longitude ring"):
+        pm.get_grid_cell_area(ds.isel(point=slice(1, None)))
+
+
+def test_gaussian_derivatives_are_periodic_and_use_matching_longitudes():
+    from physmetrics_weather._gaussian import GaussianRings
+    nodes = np.polynomial.legendre.leggauss(4)[0]
+    rows = np.arcsin(nodes)
+    errors = []
+    for scale in (1, 2):
+        counts = np.array([8, 12, 12, 8]) * scale
+        lat = np.repeat(rows, counts)
+        lon = np.concatenate([np.arange(n) * 360. / n for n in counts])
+        grid = GaussianRings.from_coords(np.rad2deg(lat), lon)
+        lam = np.deg2rad(lon)
+        north, east = grid.derivatives(lat + np.sin(lam))
+        errors.append(np.max(abs(north - 1)) + np.max(abs(east - np.cos(lam))))
+    assert errors[1] < .4 * errors[0]

@@ -34,6 +34,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
 import pyshtools as pysh
 import xarray as xr
+from physmetrics_weather._gaussian import GaussianRings
 from scipy.stats import linregress, wasserstein_distance
 
 
@@ -208,6 +209,16 @@ def get_grid_cell_area(
 
     lat = ds[lat_name].values
     lon = ds[lon_name].values
+
+    if ds[lat_name].dims == ds[lon_name].dims:
+        grid = GaussianRings.from_coords(lat, lon)
+        area = xr.zeros_like(ds[lat_name], dtype=float)
+        area.data = grid.cell_area(earth_radius)
+        area.name = "grid_cell_area"
+        return area.assign_attrs(units="m²", geometry="gaussian_rings",
+                                 latitude_rings=len(grid.rings))
+    if ds[lat_name].dims != (lat_name,) or ds[lon_name].dims != (lon_name,):
+        raise ValueError("Expected latitude/longitude axes or Gaussian rings")
 
     dlon = np.abs(np.diff(lon).mean())
     dlon_rad = np.deg2rad(dlon)
@@ -421,6 +432,21 @@ def _compute_tcwv(
 # Metric 1 — Global Dry Air Mass
 # ============================================================================
 
+def _area_for(field, area):
+    """Preserve rectangular area alignment and validate native point weights."""
+    if area.ndim == 2:
+        lat = next(d for d in field.dims if "lat" in d.lower())
+        lon = next(d for d in field.dims if "lon" in d.lower())
+        return xr.DataArray(area.data, dims=(lat, lon),
+                            coords={lat: field[lat], lon: field[lon]})
+    if not set(area.dims).issubset(field.dims):
+        raise ValueError("Field and area dimensions differ")
+    for name in area.coords:
+        if area[name].ndim and name in field.coords and not np.array_equal(area[name], field[name]):
+            raise ValueError(f"Field and area coordinates differ: {name}")
+    return area
+
+
 def compute_dry_air_mass(
     ds: xr.Dataset,
     ps: xr.DataArray,
@@ -433,11 +459,8 @@ def compute_dry_air_mass(
     if tcwv is None:
         tcwv = _compute_tcwv(ds, ps, q_name=q_name, level_dim=level_dim, levels=levels)
     col_dry = ps / GRAVITY - tcwv
-    lat_dim = [d for d in col_dry.dims if "lat" in d.lower()][0]
-    lon_dim = [d for d in col_dry.dims if "lon" in d.lower()][0]
-
-    area_aligned = xr.DataArray(area.values, dims=[lat_dim, lon_dim], coords={lat_dim: col_dry[lat_dim], lon_dim: col_dry[lon_dim]})
-    dry_mass_kg = (area_aligned * col_dry).sum(dim=[lat_dim, lon_dim], skipna=True, min_count=1)
+    area = _area_for(col_dry, area)
+    dry_mass_kg = (area * col_dry).sum(dim=area.dims, skipna=True, min_count=1)
     mass = dry_mass_kg / EXAGRAM
     return mass.assign_attrs(units="Eg", long_name="Global dry air mass")
 
@@ -458,11 +481,8 @@ def compute_water_mass(
 ) -> Union[xr.DataArray, float, Dict[Any, float]]:
     if tcwv is None:
         tcwv = _compute_tcwv(ds, ps, q_name=q_name, level_dim=level_dim, levels=levels)
-    lat_dim = [d for d in tcwv.dims if "lat" in d.lower()][0]
-    lon_dim = [d for d in tcwv.dims if "lon" in d.lower()][0]
-
-    area_aligned = xr.DataArray(area.values, dims=[lat_dim, lon_dim], coords={lat_dim: tcwv[lat_dim], lon_dim: tcwv[lon_dim]})
-    return (area_aligned * tcwv).sum(dim=[lat_dim, lon_dim], skipna=True, min_count=1)
+    area = _area_for(tcwv, area)
+    return (area * tcwv).sum(dim=area.dims, skipna=True, min_count=1)
 
 
 
@@ -493,15 +513,21 @@ def compute_total_energy(
     q = ds[q_var]
     c_p = c_pd * (1.0 - q) + c_pv * q
     ref_var = ds[t_var]
-    lat_dim_ = [d for d in ref_var.dims if "lat" in d.lower()][0]
-    lon_dim_ = [d for d in ref_var.dims if "lon" in d.lower()][0]
-
-    lat_diff = abs(z_sfc.sizes[lat_dim_] - ref_var.sizes[lat_dim_])
-    lon_diff = abs(z_sfc.sizes[lon_dim_] - ref_var.sizes[lon_dim_])
-    if lat_diff <= 1 and lon_diff == 0:
-        z_aligned = z_sfc.reindex({lat_dim_: ref_var[lat_dim_], lon_dim_: ref_var[lon_dim_]}, method="nearest")
+    if area.ndim == 1:
+        _area_for(z_sfc, area)
+        if z_sfc.dims != area.dims:
+            raise ValueError("Expected static surface geopotential per point")
+        z_aligned = z_sfc
     else:
-        raise ValueError(f"Grid mismatch too large: z_sfc={z_sfc.shape}, model={ref_var.shape}.")
+        lat_dim_ = [d for d in ref_var.dims if "lat" in d.lower()][0]
+        lon_dim_ = [d for d in ref_var.dims if "lon" in d.lower()][0]
+
+        lat_diff = abs(z_sfc.sizes[lat_dim_] - ref_var.sizes[lat_dim_])
+        lon_diff = abs(z_sfc.sizes[lon_dim_] - ref_var.sizes[lon_dim_])
+        if lat_diff <= 1 and lon_diff == 0:
+            z_aligned = z_sfc.reindex({lat_dim_: ref_var[lat_dim_], lon_dim_: ref_var[lon_dim_]}, method="nearest")
+        else:
+            raise ValueError(f"Grid mismatch too large: z_sfc={z_sfc.shape}, model={ref_var.shape}.")
 
     u_var = DatasetValidator.require_variable(ds, u_names, "Zonal Wind (u)")
     v_var = DatasetValidator.require_variable(ds, v_names, "Meridional Wind (v)")
@@ -512,8 +538,8 @@ def compute_total_energy(
     energy_density = c_p * T + z_aligned + l_v * q + 0.5 * wspd_sq
     col_energy = _integrate_column(energy_density, levels, ps, level_dim=level_dim)
 
-    area_aligned = xr.DataArray(area.values, dims=[lat_dim_, lon_dim_], coords={lat_dim_: col_energy[lat_dim_], lon_dim_: col_energy[lon_dim_]})
-    return (area_aligned * col_energy).sum(dim=[lat_dim_, lon_dim_], skipna=True, min_count=1)
+    area = _area_for(col_energy, area)
+    return (area * col_energy).sum(dim=area.dims, skipna=True, min_count=1)
 
 
 
@@ -944,14 +970,9 @@ def compute_hydrostatic_imbalance(
     rhs = r_dry * Tv_mean * np.log(p_bot / p_top)
     error = lhs - rhs
 
-    lat_dim_e = next((d for d in error.dims if "lat" in d.lower()), None)
-    lon_dim_e = next((d for d in error.dims if "lon" in d.lower()), None)
-    if lat_dim_e and lon_dim_e and list(error.dims)[-2:] != [lat_dim_e, lon_dim_e]:
-        error = error.transpose(..., lat_dim_e, lon_dim_e)
-
-    area_aligned = xr.DataArray(area.values, dims=[lat_dim_e, lon_dim_e], coords={lat_dim_e: error[lat_dim_e], lon_dim_e: error[lon_dim_e]})
-    weights = area_aligned / area_aligned.sum(dim=[lat_dim_e, lon_dim_e])
-    mse = (weights * error**2).sum(dim=[lat_dim_e, lon_dim_e], skipna=True, min_count=1)
+    area = _area_for(error, area)
+    weights = area / area.sum()
+    mse = (weights * error**2).sum(dim=area.dims, skipna=True, min_count=1)
     return mse ** 0.5
 
 
@@ -1009,16 +1030,25 @@ def compute_geostrophic_imbalance(
     f_safe = xr.where(f == 0.0, 1e-10, f)
     cos_lat_safe = xr.where(cos_lat == 0.0, 1e-10, cos_lat)
 
-    phi = phi.chunk({lat_name: -1, lon_name: -1})
-    dPhi_dphi = phi.differentiate(lat_name) * (180.0 / np.pi)
+    if lat.dims == lon.dims:
+        grid = GaussianRings.from_coords(lat, lon)
+        dim, = lat.dims
+        dPhi_dphi, dPhi_dlam = xr.apply_ufunc(
+            grid.derivatives, phi.chunk({dim: -1}) if phi.chunks else phi,
+            input_core_dims=[[dim]], output_core_dims=[[dim], [dim]],
+            vectorize=True, dask="parallelized", output_dtypes=[float, float],
+        )
+    else:
+        phi = phi.chunk({lat_name: -1, lon_name: -1})
+        dPhi_dphi = phi.differentiate(lat_name) * (180.0 / np.pi)
 
-    phi_east = phi.shift({lon_name: -1})
-    phi_west = phi.shift({lon_name: 1})
+        phi_east = phi.shift({lon_name: -1})
+        phi_west = phi.shift({lon_name: 1})
 
-    phi_east = xr.where(phi_east.isnull(), phi.isel({lon_name: 0}), phi_east)
-    phi_west = xr.where(phi_west.isnull(), phi.isel({lon_name: -1}), phi_west)
-    dlon_rad = np.deg2rad(np.abs(lon.values[1] - lon.values[0]))
-    dPhi_dlam = (phi_east - phi_west) / (2.0 * dlon_rad)
+        phi_east = xr.where(phi_east.isnull(), phi.isel({lon_name: 0}), phi_east)
+        phi_west = xr.where(phi_west.isnull(), phi.isel({lon_name: -1}), phi_west)
+        dlon_rad = np.deg2rad(np.abs(lon.values[1] - lon.values[0]))
+        dPhi_dlam = (phi_east - phi_west) / (2.0 * dlon_rad)
 
     u_g = -dPhi_dphi / (f_safe * earth_radius)
     v_g = dPhi_dlam / (f_safe * earth_radius * cos_lat_safe)
@@ -1028,6 +1058,10 @@ def compute_geostrophic_imbalance(
     vec_err_sq = du**2 + dv**2
 
     lat_mask = (np.abs(lat) >= lat_cutoff) & (np.abs(lat) < 89.9)
+    if area.ndim == 1:
+        weights = _area_for(vec_err_sq, area).where(lat_mask, 0)
+        return ((vec_err_sq.where(lat_mask, 0) * weights).sum(
+            dim=area.dims, skipna=False) / weights.sum()) ** 0.5
     vec_err_sq = xr.where(lat_mask, vec_err_sq.fillna(0.0), 0.0)
 
     area_aligned = xr.DataArray(area.values, dims=[lat_name, lon_name], coords={lat_name: ds[lat_name], lon_name: ds[lon_name]})
