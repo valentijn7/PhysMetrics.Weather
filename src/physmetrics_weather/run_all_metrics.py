@@ -53,7 +53,10 @@ from physmetrics_weather.physics_metrics import (
     _detect_pred_td_dim,
     _find_effective_resolution,
     _find_var,
-    compute_conservation_scalars,
+    _compute_tcwv,
+    compute_dry_air_mass,
+    compute_total_energy,
+    compute_water_mass,
     compute_drift_percentages,
     compute_drift_slope,
     compute_geostrophic_imbalance,
@@ -98,6 +101,17 @@ DRIFT_WINDOW_END: Dict[int, np.timedelta64] = {
     240: np.timedelta64(240, "h"),
 }
 
+
+SERIES = ("dry_mass_Eg", "water_mass_kg", "total_energy_J",
+          "hydrostatic_rmse", "geostrophic_rmse")
+DRIFT = dict(zip(("dry_mass_drift_pct_per_day", "water_mass_drift_pct_per_day",
+                  "total_energy_drift_pct_per_day"), SERIES[:3]))
+SPECTRAL = {"spectrum", "effective_resolution_km", "small_scale_ratio",
+            "spectral_divergence", "spectral_residual"}
+LAPSE = {"lapse_rate_w1_nh_mid", "lapse_rate_w1_sh_mid",
+         "lapse_rate_w1_tropics", "lapse_rate_distribution"}
+METRICS = set(SERIES) | DRIFT.keys() | SPECTRAL | LAPSE
+
 DEFAULT_WORKERS: int = 4
 
 
@@ -135,7 +149,12 @@ class EvaluationConfig:
     sp_ablation: str = "default"
     spectra: Optional[List[Tuple[str, float]]] = None
 
+    metrics: Optional[List[str]] = None
+
     def __post_init__(self) -> None:
+        if self.metrics is not None:
+            if not self.metrics or set(self.metrics) - METRICS:
+                raise ValueError(f"Choose one or more metrics from {sorted(METRICS)}")
         if self.lead_times is None:
             self.lead_times = LEAD_TIMES
         if self.spectra is None:
@@ -437,6 +456,28 @@ def _parse_spectra_spec(spec: str) -> List[Tuple[str, float]]:
 # ============================================================================
 
 
+def _budget_values(ds, ps, area, surface, level_dim, names):
+    values = {}
+    q = _find_var(ds, Q_NAMES)
+    if q is None:
+        raise ValueError("Missing specific humidity for budget calculation")
+    if names.intersection(SERIES[:2]):
+        water = _compute_tcwv(ds, ps, q_name=q, level_dim=level_dim)
+        for name, function in zip(SERIES[:2], (compute_dry_air_mass, compute_water_mass)):
+            if name in names:
+                values[name] = function(ds, ps, area, level_dim=level_dim, tcwv=water)
+    if "total_energy_J" in names:
+        try:
+            values["total_energy_J"] = compute_total_energy(
+                ds, ps, area, surface, q_name=q, level_dim=level_dim
+            )
+        except (ValueError, KeyError, AttributeError):
+            if not values:
+                raise
+            values["total_energy_J"] = xr.full_like(next(iter(values.values())), np.nan)
+    return values
+
+
 def _evaluate_one(
     model_zarr_path: str,
     ref_zarr_path: str,
@@ -452,6 +493,7 @@ def _evaluate_one(
     extended_spectra: bool = False,
     sp_ablation: str = "default",
     spectra: Optional[List[Tuple[str, float]]] = None,
+    metrics: Optional[List[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Fetch, preprocess, and evaluate physics metrics for one date and lead time slice.
 
@@ -487,8 +529,51 @@ def _evaluate_one(
 
     ds_ref_full = open_zarr_anonymous(ref_zarr_path)
 
-    ds_static_src = open_zarr_anonymous(static_zarr_path) if static_zarr_path else ds_ref_full
-    ds_static = load_static_fields(ds_static_src)
+    if ds_model_full is not None and "init_time" in ds_model_full.dims:
+        ds_model_full = ds_model_full.rename({"init_time": "time"})
+    if "valid_time" in ds_ref_full.dims:
+        ds_ref_full = ds_ref_full.rename({"valid_time": "time"})
+    area = get_grid_cell_area(ds_ref_full.isel(time=0, drop=True))
+    ref_grid = area.attrs.get("geometry", "regular_lat_lon")
+    model_grid = ref_grid
+    if ds_model_full is not None:
+        if ds_model_full.latitude.dims == ds_model_full.longitude.dims:
+            model_grid = "gaussian_rings"
+        else:
+            model_grid = "regular_lat_lon"
+    native = "gaussian_rings" in (model_grid, ref_grid)
+    if native and ds_model_full is not None:
+        for coord in ("latitude", "longitude"):
+            if not ds_model_full[coord].variable.equals(ds_ref_full[coord].variable):
+                raise ValueError(f"Forecast/reference point grid mismatch: {coord}")
+        dim = ds_ref_full.latitude.dims[0]
+        if not ds_model_full.get_index(dim).equals(ds_ref_full.get_index(dim)):
+            raise ValueError("Forecast/reference point indexes differ")
+    _log(f"Grid: forecast={model_grid}, reference={ref_grid}")
+    selected = set(METRICS if metrics is None else metrics)
+    if native and selected & SPECTRAL:
+        omitted = ", ".join(sorted(selected & SPECTRAL))
+        warnings.warn(f"Omitted {omitted}: Gaussian spectral transform unavailable.")
+        selected -= SPECTRAL
+        if not selected:
+            raise ValueError("All requested metrics require a Gaussian spectral transform")
+    needed = selected | {source for rate, source in DRIFT.items() if rate in selected}
+    budgets = needed.intersection(SERIES[:3])
+    needs_static = "total_energy_J" in needed or (
+        budgets and any(ds is not None and _find_var(ds, SP_NAMES) is None
+                        and _find_var(ds, MSL_NAMES) is not None
+                        for ds in (ds_model_full, ds_ref_full))
+    )
+    ds_static = xr.Dataset()
+    if needs_static:
+        source = open_zarr_anonymous(static_zarr_path) if static_zarr_path else ds_ref_full
+        ds_static = load_static_fields(source)
+    if needs_static and native and ds_model_full is not None:
+        for coord in ("latitude", "longitude"):
+            if not ds_ref_full[coord].variable.equals(ds_static[coord].variable):
+                raise ValueError(f"Static point grid mismatch: {coord}")
+        if not ds_ref_full.get_index(dim).equals(ds_static.get_index(dim)):
+            raise ValueError("Static point indexes differ")
 
     for var_name in list(ds_static.data_vars):
         v = ds_static[var_name]
@@ -497,11 +582,9 @@ def _evaluate_one(
                 ds_static[var_name] = v.transpose("latitude", "longitude")
 
     z_sfc_name = _find_var(ds_static, ZSFC_NAMES)
-    if z_sfc_name is None:
+    if needs_static and z_sfc_name is None:
         raise ValueError(f"No surface geopotential in static dataset. Tried {ZSFC_NAMES}.")
-    z_sfc = ds_static[z_sfc_name]
-
-    area = get_grid_cell_area(ds_ref_full.isel(time=0, drop=True))
+    z_sfc = ds_static[z_sfc_name] if z_sfc_name else None
     lead_hours = int(lead_td / np.timedelta64(1, "h"))
     init_time = np.datetime64(date_str, "ns")
     valid_time = init_time + lead_td
@@ -520,6 +603,8 @@ def _evaluate_one(
         ref_val: Any = None,
         ens_member: Any = 0,
     ) -> None:
+        if metrics is not None and metric_name not in selected and metric_name not in {"ERROR", "ALL_METRICS_FAILED"}:
+            return
         summary_rows.append(
             {
                 "date": date_str,
@@ -534,6 +619,7 @@ def _evaluate_one(
         )
 
     try:
+        _use_ref_sp = False
         ds_model_t = None
         ps_model = None
         area_model = area
@@ -612,12 +698,13 @@ def _evaluate_one(
                     dims_list[idx_lon], dims_list[idx_lat] = dims_list[idx_lat], dims_list[idx_lon]
                     ds_model_t = ds_model_t.transpose(*dims_list)
 
-            ds_model_t = ds_model_t.load()
-            model_grid_matches_ref = _grids_match(ds_model_t, ds_ref_full)
+            if metrics is None:
+                ds_model_t = ds_model_t.load()
+            model_grid_matches_ref = native or _grids_match(ds_model_t, ds_ref_full)
 
             ds_static_model = ds_static
             z_sfc_model = z_sfc
-            if not model_grid_matches_ref:
+            if needs_static and not model_grid_matches_ref:
                 interp_coords = {
                     "latitude": ds_model_t["latitude"].values,
                     "longitude": ds_model_t["longitude"].values,
@@ -634,7 +721,7 @@ def _evaluate_one(
             _model_can_derive_sp = _has_sp or _has_msl
             _use_ref_sp = not _model_can_derive_sp
 
-            if has_q and not _use_ref_sp:
+            if budgets and has_q and not _use_ref_sp:
                 try:
                     ps_model = _get_ps(ds_model_t, ds_static_model, level_dim=model_level_dim)
                 except (ValueError, KeyError, AttributeError) as exc:
@@ -660,12 +747,15 @@ def _evaluate_one(
         ds_ref_t = ds_ref_full.sel(time=valid_time)
         if "time" in ds_ref_t.dims:
             ds_ref_t = ds_ref_t.isel(time=0)
-        ds_ref_t = ds_ref_t.load()
+        if metrics is None:
+            ds_ref_t = ds_ref_t.load()
 
         ref_level_dim = _detect_level_dim(ds_ref_t)
-        ps_ref = _get_ps(ds_ref_t, ds_static, level_dim=ref_level_dim)
+        ps_ref = None
+        if budgets and (metrics is None or _use_ref_sp):
+            ps_ref = _get_ps(ds_ref_t, ds_static, level_dim=ref_level_dim)
 
-        if _use_ref_sp and ps_ref is not None and has_q and ds_model_t is not None:
+        if ps_ref is not None and _use_ref_sp and has_q and ds_model_t is not None:
             if not model_grid_matches_ref:
                 ps_model = ps_ref.interp(
                     latitude=ds_model_t.latitude, longitude=ds_model_t.longitude, method="linear"
@@ -681,7 +771,7 @@ def _evaluate_one(
         return summary_rows, ts_rows, spectrum_rows, lr_dist_rows
 
     _mode_valid = mode in ("joint", "prediction", "model")
-    if _mode_valid and ds_model_full is not None:
+    if _mode_valid and ds_model_full is not None and needed.intersection(SERIES):
         try:
             td_start = np.timedelta64(12, "h")
             td_end = DRIFT_WINDOW_END.get(lead_hours, lead_td)
@@ -691,14 +781,18 @@ def _evaluate_one(
             ds_pred_window = ds_pred_init.sel({pred_td_dim: slice(td_start, td_end)})
 
             avail_tds = ds_pred_window[pred_td_dim].values
-            fit_drift = len(avail_tds) >= 2
-            if not fit_drift:
+            fit_drift = len(avail_tds) >= 2 and bool(selected.intersection(DRIFT))
+            if len(avail_tds) < 2 and selected.intersection(DRIFT):
+                warnings.warn(f"{date_str} {lead_label}: insufficient leads for drift rates.")
+            if len(avail_tds) < 2 and selected.intersection(SERIES):
                 ds_pred_window = ds_pred_init.sel({pred_td_dim: [lead_td]})
                 avail_tds = ds_pred_window[pred_td_dim].values
-            if len(avail_tds):
+            if fit_drift or selected.intersection(SERIES):
                 model_level_dim_d = _detect_level_dim(ds_pred_window)
 
-                if not _use_ref_sp:
+                if not budgets:
+                    ps_pred_window, step_sp_method = None, _sp_method
+                elif not _use_ref_sp:
                     try:
                         ps_pred_window = _get_ps(ds_pred_window, ds_static_model, level_dim=model_level_dim_d)
                         step_sp_method = ps_pred_window.attrs.get("derivation_method", "unknown")
@@ -709,38 +803,26 @@ def _evaluate_one(
                     ps_pred_window = ps_model
                     step_sp_method = "ref_sp"
 
-                t_name_for_nan = _find_var(ds_pred_window, T_NAMES) or "temperature"
-                nan_arr = xr.full_like(
-                    ds_pred_window[t_name_for_nan].isel({model_level_dim_d: 0, "latitude": 0, "longitude": 0}, drop=True),
-                    np.nan
-                )
-
-                try:
-                    dry, water, energy = compute_conservation_scalars(
-                        ds_pred_window, ps_pred_window, area_model, z_sfc=z_sfc_model, level_dim=model_level_dim_d
-                    )
-                except (ValueError, KeyError, AttributeError):
-                    dry, water, energy = nan_arr, nan_arr, nan_arr
-                    step_sp_method = "failed"
-
-                try:
-                    hydro = compute_hydrostatic_imbalance(ds_pred_window, area_model, level_dim=model_level_dim_d)
-                except (ValueError, KeyError, AttributeError):
-                    hydro = nan_arr
-
-                try:
-                    geo = compute_geostrophic_imbalance(ds_pred_window, area_model, level_dim=model_level_dim_d)
-                except (ValueError, KeyError, AttributeError):
-                    geo = nan_arr
-
-                ds_metrics = xr.Dataset({
-                    "dry_mass_Eg": dry,
-                    "water_mass_kg": water,
-                    "total_energy_J": energy,
-                    "hydrostatic_rmse": hydro,
-                    "geostrophic_rmse": geo,
-                })
-
+                shape = {pred_td_dim: ds_pred_window[pred_td_dim]}
+                if ens_dim:
+                    shape[ens_dim] = ds_pred_window[ens_dim]
+                template = xr.DataArray(np.nan).expand_dims(shape)
+                fields = {name: template for name in needed.intersection(SERIES)}
+                if budgets and has_q and ps_pred_window is not None:
+                    try:
+                        fields.update(_budget_values(ds_pred_window, ps_pred_window,
+                                                     area_model, z_sfc_model,
+                                                     model_level_dim_d, budgets))
+                    except (ValueError, KeyError, AttributeError):
+                        step_sp_method = "failed"
+                for name, function in (("hydrostatic_rmse", compute_hydrostatic_imbalance),
+                                       ("geostrophic_rmse", compute_geostrophic_imbalance)):
+                    if name in needed:
+                        try:
+                            fields[name] = function(ds_pred_window, area_model, level_dim=model_level_dim_d)
+                        except (ValueError, KeyError, AttributeError):
+                            pass
+                ds_metrics = xr.Dataset(fields)
                 ds_metrics = ds_metrics.compute()
                 df_metrics = ds_metrics.to_dataframe().reset_index()
 
@@ -748,19 +830,19 @@ def _evaluate_one(
                 leads = np.sort(avail_tds)
                 hours_ref = leads / np.timedelta64(1, "h")
                 ref_water = ref_energy = np.full(leads.shape, np.nan)
-                try:
-                    ref = ds_ref_full.sel(time=init_time + leads)
-                    ref = ref.chunk({"time": 1})
-                    ps = _get_ps(ref, ds_static, level_dim=ref_level_dim)
-                    _, water, energy = compute_conservation_scalars(
-                        ref, ps, area, z_sfc=z_sfc, level_dim=ref_level_dim
-                    )
-                    budgets = xr.Dataset({"water": water, "energy": energy})
-                    budgets = budgets.transpose("time").compute()
-                    ref_water = budgets.water.values
-                    ref_energy = budgets.energy.values
-                except (ValueError, KeyError, AttributeError) as exc:
-                    _log(f"    [{counter}] Reference drift unavailable: {exc}")
+                ref_names = {DRIFT[k] for k in selected.intersection(DRIFT)} - {"dry_mass_Eg"}
+                if fit_drift and ref_names:
+                    try:
+                        ref = ds_ref_full.sel(time=init_time + leads).chunk({"time": 1})
+                        ps = _get_ps(ref, ds_static, level_dim=ref_level_dim)
+                        values = _budget_values(ref, ps, area, z_sfc, ref_level_dim, ref_names)
+                        result = xr.Dataset(values).transpose("time").compute()
+                        if "water_mass_kg" in result:
+                            ref_water = result.water_mass_kg.values
+                        if "total_energy_J" in result:
+                            ref_energy = result.total_energy_J.values
+                    except (ValueError, KeyError, AttributeError) as exc:
+                        _log(f"Reference drift unavailable: {exc}")
 
                 for m in ens_members:
                     if ens_dim and ens_dim in df_metrics.columns:
@@ -771,48 +853,40 @@ def _evaluate_one(
                     df_m = df_m.sort_values(pred_td_dim)
 
                     hours_model = np.array([float(td / np.timedelta64(1, "h")) for td in df_m[pred_td_dim].values])
-                    dry_vals = df_m["dry_mass_Eg"].values
-                    water_vals = df_m["water_mass_kg"].values
-                    energy_vals = df_m["total_energy_J"].values
-                    hydro_vals = df_m["hydrostatic_rmse"].values
-                    geo_vals = df_m["geostrophic_rmse"].values
-
-                    for i, h in enumerate(hours_model):
-                        ts_rows.append({
-                            "date": date_str,
-                            "forecast_hour": float(h),
-                            "dry_mass_Eg": float(dry_vals[i]),
-                            "water_mass_kg": float(water_vals[i]),
-                            "total_energy_J": float(energy_vals[i]),
-                            "hydrostatic_rmse": float(hydro_vals[i]),
-                            "geostrophic_rmse": float(geo_vals[i]),
-                            "sp_method": step_sp_method,
-                            "ensemble_member": m,
-                        })
+                    columns = [k for k in SERIES if k in selected]
+                    if columns:
+                        for _, row in df_m.iterrows():
+                            ts_rows.append({
+                                "date": date_str,
+                                "forecast_hour": float(row[pred_td_dim] / np.timedelta64(1, "h")),
+                                **{k: float(row[k]) for k in columns},
+                                "sp_method": step_sp_method, "ensemble_member": m,
+                            })
 
                     ref_hydro, ref_geo = None, None
-                    if ds_ref_t is not None:
+                    if selected.intersection(SERIES[3:]):
                         ref_ld = _detect_level_dim(ds_ref_t)
                         try:
-                            ref_hydro = float(compute_hydrostatic_imbalance(ds_ref_t, area, level_dim=ref_ld))
+                            if "hydrostatic_rmse" in selected:
+                                ref_hydro = float(compute_hydrostatic_imbalance(ds_ref_t, area, level_dim=ref_ld))
                         except (ValueError, KeyError, AttributeError):
                             pass
                         try:
-                            ref_geo = float(compute_geostrophic_imbalance(ds_ref_t, area, level_dim=ref_ld))
+                            if "geostrophic_rmse" in selected:
+                                ref_geo = float(compute_geostrophic_imbalance(ds_ref_t, area, level_dim=ref_ld))
                         except (ValueError, KeyError, AttributeError):
                             pass
 
                     at_lead = df_m.loc[df_m[pred_td_dim] == lead_td]
-                    if not at_lead.empty:
-                        _append_summary(
-                            "hydrostatic_rmse", at_lead["hydrostatic_rmse"].item(), ref_hydro, ens_member=m
-                        )
-                        _append_summary(
-                            "geostrophic_rmse", at_lead["geostrophic_rmse"].item(), ref_geo, ens_member=m
-                        )
-
+                    for name, reference in zip(SERIES[3:], (ref_hydro, ref_geo)):
+                        if name in selected and not at_lead.empty:
+                            _append_summary(name, at_lead[name].item(), reference, ens_member=m)
                     if not fit_drift:
                         continue
+                    missing = np.full(hours_model.shape, np.nan)
+                    dry_vals, water_vals, energy_vals = (
+                        df_m[k].values if k in df_m else missing for k in SERIES[:3]
+                    )
                     if not np.array_equal(hours_model, hours_ref):
                         raise ValueError("Forecast/reference drift leads differ")
                     rates = compute_drift_percentages(
@@ -842,17 +916,17 @@ def _evaluate_one(
 
     if (
         mode in ("joint", "prediction", "model")
-        and ds_model_full is not None
+        and ds_model_full is not None and selected.intersection(SPECTRAL | LAPSE)
     ):
         try:
-            ds_ref_aligned = _align_ref_to_model(ds_ref_t, ds_model_t)
+            ds_ref_aligned = ds_ref_t if native else _align_ref_to_model(ds_ref_t, ds_model_t)
         except ValueError as exc:
             _log(f"    [{counter}] Grid alignment failed: {exc}")
             ds_ref_aligned = None
 
         if ds_ref_aligned is not None:
             spectra_list = spectra or [("KE", 500.0)]
-            for m in ens_members:
+            for m in (ens_members if selected.intersection(LAPSE) else []):
                 if ens_dim and ens_dim in ds_model_t.dims:
                     ds_model_m = ds_model_t.sel({ens_dim: m})
                 else:
@@ -860,9 +934,11 @@ def _evaluate_one(
 
                 # Environmental Lapse Rate Wasserstein Distance
                 try:
+                    regions = tuple(k.removeprefix("lapse_rate_w1_") for k in sorted(selected)
+                                    if k.startswith("lapse_rate_w1_"))
                     lr_results = compute_lapse_rate_wasserstein(
-                        ds_model_m, ds_ref_aligned, area_model
-                    )
+                        ds_model_m, ds_ref_aligned, area_model, regions=regions
+                    ) if regions else {}
                     for band_key, w1_val in lr_results.items():
                         _append_summary(band_key, w1_val, None, ens_member=m)
 
@@ -886,7 +962,7 @@ def _evaluate_one(
                         phi_bot = ds[phi_var].isel({ld: idx_bot})
                         return -9.80665 * (t_top - t_bot) / (phi_top - phi_bot) * 1000.0
 
-                    if t_name_p and phi_name_p and t_name_r and phi_name_r:
+                    if "lapse_rate_distribution" in selected and t_name_p and phi_name_p and t_name_r and phi_name_r:
                         gamma_pred = _get_gamma(ds_model_m, t_name_p, phi_name_p, ld_p)
                         gamma_ref = _get_gamma(ds_ref_aligned, t_name_r, phi_name_r, ld_r)
 
@@ -933,8 +1009,11 @@ def _evaluate_one(
                     for band_key, w1_val in lr_results.items():
                         _append_summary(band_key, w1_val, None, ens_member=m)
 
+            for m in (ens_members if selected.intersection(SPECTRAL) else []):
+                ds_model_m = ds_model_t.sel({ens_dim: m}) if ens_dim else ds_model_t
                 # Configurable Target Spectra Evaluation
-                for s_idx, (var_type, lvl_val) in enumerate(spectra_list):
+                targets = spectra_list if "spectrum" in selected else spectra_list[:1]
+                for s_idx, (var_type, lvl_val) in enumerate(targets):
                     v_key = var_type.upper()
                     var_label = f"{v_key}_{int(lvl_val)}"
 
@@ -959,7 +1038,7 @@ def _evaluate_one(
                         e_ref_c = e_r[:n_min]
 
                         # Primary spectrum (first entry) generates summary metrics
-                        if s_idx == 0:
+                        if s_idx == 0 and selected.intersection({"effective_resolution_km", "small_scale_ratio"}):
                             eff_res_out = _find_effective_resolution(
                                 k_common, e_pred_c, e_ref_c
                             )
@@ -968,7 +1047,6 @@ def _evaluate_one(
                                 if isinstance(eff_res_out, tuple)
                                 else (eff_res_out, float("nan"))
                             )
-                            s_div, s_res = compute_spectral_scores(e_pred_c, e_ref_c)
 
                             _append_summary(
                                 "effective_resolution_km", L_eff, None, ens_member=m
@@ -976,6 +1054,8 @@ def _evaluate_one(
                             _append_summary(
                                 "small_scale_ratio", ratio, None, ens_member=m
                             )
+                        if s_idx == 0 and selected.intersection({"spectral_divergence", "spectral_residual"}):
+                            s_div, s_res = compute_spectral_scores(e_pred_c, e_ref_c)
                             _append_summary(
                                 "spectral_divergence", s_div, None, ens_member=m
                             )
@@ -983,7 +1063,7 @@ def _evaluate_one(
                                 "spectral_residual", s_res, None, ens_member=m
                             )
 
-                        for wi in range(n_min):
+                        for wi in range(n_min if "spectrum" in selected else 0):
                             spectrum_rows.append({
                                 "date": date_str,
                                 "lead_hours": lead_hours,
@@ -999,7 +1079,7 @@ def _evaluate_one(
                             f"for member {m}: {exc}"
                         )
 
-    if not summary_rows:
+    if not any((summary_rows, ts_rows, spectrum_rows, lr_dist_rows)):
         _append_summary("ALL_METRICS_FAILED", None, None, ens_member=0)
 
     return summary_rows, ts_rows, spectrum_rows, lr_dist_rows
@@ -1066,6 +1146,7 @@ class EvaluationPipeline:
                     self.config.extended_spectra,
                     self.config.sp_ablation,
                     self.config.spectra,
+                    self.config.metrics,
                 )
                 futures[fut] = (idx, date_str, lead_label)
 
@@ -1099,6 +1180,8 @@ class EvaluationPipeline:
                     all_spectrum_rows.extend(spectrum_rows)
                     all_lr_dist_rows.extend(lr_dist_rows)
                 except TimeoutError:
+                    if self.config.metrics is not None:
+                        raise
                     if self.config.verbose:
                         print(
                             f"\n  ⚠ Task {idx} ({date_str} {lead_label}) "
@@ -1112,10 +1195,12 @@ class EvaluationPipeline:
                     OSError,
                     IOError,
                 ) as exc:
+                    if self.config.metrics is not None:
+                        raise
                     if self.config.verbose:
                         print(f"\n  ⚠ Worker exception (task {idx}): {exc}")
 
-        if not all_rows:
+        if not any((all_rows, all_ts_rows, all_spectrum_rows, all_lr_dist_rows)):
             if self.config.verbose:
                 print("\n  ⚠ No successful results obtained.")
             return pd.DataFrame()
@@ -1130,9 +1215,10 @@ class EvaluationPipeline:
         )
         df = pd.DataFrame(all_rows)
         self.config.output_csv.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(self.config.output_csv, index=False)
+        if all_rows:
+            df.to_csv(self.config.output_csv, index=False)
 
-        if self.config.verbose:
+        if self.config.verbose and all_rows:
             print(f"\n  ✓ Summary saved → {self.config.output_csv} ({len(df)} rows)")
 
         if all_ts_rows:
@@ -1187,6 +1273,7 @@ def run_evaluation(
     extended_spectra: bool = False,
     sp_ablation: str = "default",
     spectra: Optional[List[Tuple[str, float]]] = None,
+    metrics: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """Backward-compatible wrapper function for running evaluation pipeline.
 
@@ -1222,6 +1309,7 @@ def run_evaluation(
         extended_spectra=extended_spectra,
         sp_ablation=sp_ablation,
         spectra=spectra,
+        metrics=metrics,
     )
     pipeline = EvaluationPipeline(config)
     return pipeline.run()
@@ -1299,6 +1387,8 @@ def main() -> None:
         help="Comma-separated target spectra (e.g. 'KE:500,Q:500,T:850')."
     )
 
+    parser.add_argument("--metrics", nargs="+", choices=sorted(METRICS),
+                        help="Compute the named diagnostics (default: standard suite).")
     args = parser.parse_args()
     dates = _resolve_dates(args)
 
@@ -1325,6 +1415,7 @@ def main() -> None:
         extended_spectra=args.extended_spectra,
         sp_ablation=args.sp_ablation,
         spectra=spec_list,
+        metrics=args.metrics,
     )
 
 

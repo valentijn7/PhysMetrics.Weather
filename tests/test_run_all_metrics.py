@@ -146,9 +146,63 @@ def test_single_lead_emits_balance_and_budgets_without_drift(monkeypatch):
     stores = {"pred": pred.isel(prediction_timedelta=[0]), "ref": ref.isel(time=[0])}
     monkeypatch.setattr(runner, "open_zarr_anonymous", stores.__getitem__)
     monkeypatch.setattr(runner, "_align_ref_to_model", lambda *args: None)
-    rows, series, *_ = runner._evaluate_one(
-        "pred", "ref", "2020-01-01", "12h", leads[0], 1, 1, "joint", False
-    )
+    with pytest.warns(UserWarning, match="insufficient leads for drift rates"):
+        rows, series, *_ = runner._evaluate_one(
+            "pred", "ref", "2020-01-01", "12h", leads[0], 1, 1, "joint", False
+        )
     assert {r["metric_name"] for r in rows} == {"hydrostatic_rmse", "geostrophic_rmse"}
     assert {(r["forecast_hour"], r["ensemble_member"]) for r in series} == {(12, 0), (12, 1)}
     assert all(np.isfinite(r["dry_mass_Eg"]) for r in series)
+
+
+@pytest.mark.parametrize("gaussian", [False, True])
+def test_selected_metric_matches_full_run(monkeypatch, gaussian):
+    pred, ref, leads = _two_lead_datasets()
+    init = np.datetime64("2020-01-01T06", "ns")
+    pred = pred.assign_coords(time=[init])
+    ref = ref.assign_coords(time=init + leads)
+    if gaussian:
+        nodes, _ = np.polynomial.legendre.leggauss(6)
+        counts = [4, 6, 8, 8, 6, 4]
+        coords = {
+            "latitude": ("cell", np.repeat(np.degrees(np.arcsin(nodes)), counts)),
+            "longitude": ("cell", np.concatenate([np.arange(n) * 360 / n for n in counts])),
+        }
+
+        def on_rings(ds):
+            return ds.isel(latitude=0, longitude=0, drop=True).expand_dims(
+                cell=sum(counts)
+            ).assign_coords(coords)
+
+        pred, ref = on_rings(pred), on_rings(ref)
+    stores = {"pred": pred, "ref": ref}
+    monkeypatch.setattr(runner, "open_zarr_anonymous", stores.__getitem__)
+    # The regular-grid fixture is too small for a meaningful spectrum.
+    if not gaussian:
+        monkeypatch.setattr(runner, "_align_ref_to_model", lambda *args: None)
+    args = ("pred", "ref", str(init), "12h", leads[0], 1, 1, "joint", False)
+    if gaussian:
+        with pytest.warns(UserWarning, match="Omitted .*spectrum"):
+            full, series, *_ = runner._evaluate_one(*args)
+        with pytest.warns(UserWarning, match="Omitted .*spectrum"):
+            with pytest.raises(ValueError, match="Gaussian spectral transform"):
+                runner._evaluate_one(*args, metrics=["spectrum"])
+    else:
+        full, series, *_ = runner._evaluate_one(*args)
+    name = "hydrostatic_rmse"
+    stores["ref"] = ref.drop_vars("geopotential_at_surface")
+    selected, _, *_ = runner._evaluate_one(*args, metrics=[name])
+    expected = [r for r in full if r["metric_name"] == name]
+    assert len(selected) == len(expected) == 2
+    for actual, original in zip(selected, expected):
+        for key in ("date", "lead_time_hours", "ensemble_member", "metric_name"):
+            assert actual[key] == original[key]
+        assert np.isfinite(actual["model_value"])
+        assert actual["model_value"] == pytest.approx(original["model_value"])
+        assert actual["ref_value"] == pytest.approx(original["ref_value"])
+    summary, only_water, *_ = runner._evaluate_one(*args, metrics=["water_mass_kg"])
+    assert not summary
+    assert len(series) == len(only_water) == 4
+    for actual, original in zip(only_water, series):
+        assert "total_energy_J" not in actual
+        assert actual["water_mass_kg"] == pytest.approx(original["water_mass_kg"])

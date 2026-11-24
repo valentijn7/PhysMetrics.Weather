@@ -1088,6 +1088,7 @@ def compute_lapse_rate_wasserstein(
     level_dim_ref: Optional[str] = None,
     p_top: float = LAPSE_RATE_P_TOP,
     p_bot: float = LAPSE_RATE_P_BOT,
+    regions: Optional[Tuple[str, ...]] = None,
 ) -> Dict[str, float]:
     """Compute 1D Wasserstein distance of lapse rate distribution for geographic bands.
 
@@ -1144,6 +1145,8 @@ def compute_lapse_rate_wasserstein(
 
     results = {}
     for band_name, (mask_p, mask_r) in bands.items():
+        if regions is not None and band_name not in regions:
+            continue
         gp_band = gamma_p.where(mask_p, drop=True).values.flatten()
         gr_band = gamma_r.where(mask_r, drop=True).values.flatten()
 
