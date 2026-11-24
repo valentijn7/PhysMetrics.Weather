@@ -798,9 +798,14 @@ def _evaluate_one(
                         except (ValueError, KeyError, AttributeError):
                             pass
 
-                    if len(hydro_vals) > 0:
-                        _append_summary("hydrostatic_rmse", float(hydro_vals[-1]), ref_hydro, ens_member=m)
-                        _append_summary("geostrophic_rmse", float(geo_vals[-1]), ref_geo, ens_member=m)
+                    at_lead = df_m.loc[df_m[pred_td_dim] == lead_td]
+                    if not at_lead.empty:
+                        _append_summary(
+                            "hydrostatic_rmse", at_lead["hydrostatic_rmse"].item(), ref_hydro, ens_member=m
+                        )
+                        _append_summary(
+                            "geostrophic_rmse", at_lead["geostrophic_rmse"].item(), ref_geo, ens_member=m
+                        )
 
                     if not np.array_equal(hours_model, hours_ref):
                         raise ValueError("Forecast/reference drift leads differ")

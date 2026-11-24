@@ -70,8 +70,7 @@ def test_align_ref_to_model():
     assert aligned.sizes["latitude"] == 32
 
 
-@pytest.mark.parametrize("missing_reference", [False, True])
-def test_cli_matches_reference_budget_trends(monkeypatch, missing_reference):
+def _two_lead_datasets():
     init = np.datetime64("2020-01-01", "ns")
     leads = np.array([12, 24], dtype="timedelta64[h]")
     ref = xr.Dataset(coords={
@@ -92,6 +91,12 @@ def test_cli_matches_reference_budget_trends(monkeypatch, missing_reference):
     members = xr.IndexVariable("ens", [0, 1])
     pred = xr.concat([pred, pred], dim=members, data_vars="all")
     pred["surface_pressure"][1] = 100000.
+    return pred, ref, leads
+
+
+@pytest.mark.parametrize("missing_reference", [False, True])
+def test_cli_matches_reference_budget_trends(monkeypatch, missing_reference):
+    pred, ref, leads = _two_lead_datasets()
     if missing_reference:
         ref = ref.isel(time=[1])
     stores = {"pred": pred, "ref": ref}
@@ -107,3 +112,30 @@ def test_cli_matches_reference_budget_trends(monkeypatch, missing_reference):
             assert np.isnan(values).all()
         else:
             np.testing.assert_allclose(values, [0., -2.], atol=1e-9)
+
+
+def test_balance_summary_pairs_12h_forecast_with_12h_reference(monkeypatch):
+    pred, ref, leads = _two_lead_datasets()
+    pred["surface_pressure"] = pred.surface_pressure + 200 * pred.ens
+    stores = {"pred": pred, "ref": ref}
+    monkeypatch.setattr(runner, "open_zarr_anonymous", stores.__getitem__)
+    monkeypatch.setattr(runner, "_align_ref_to_model", lambda *args: None)
+
+    # Distinct lead/member markers isolate time pairing from numerical kernels.
+    def marker(ds, area, level_dim):
+        return ds.surface_pressure.isel(latitude=0, longitude=0, drop=True)
+
+    monkeypatch.setattr(runner, "compute_hydrostatic_imbalance", marker)
+    monkeypatch.setattr(runner, "compute_geostrophic_imbalance", marker)
+    rows, series, *_ = runner._evaluate_one(
+        "pred", "ref", "2020-01-01", "12h", leads[0], 1, 1, "joint", False
+    )
+    for metric in ("hydrostatic_rmse", "geostrophic_rmse"):
+        actual = {
+            (row["lead_time_hours"], row["ensemble_member"]):
+                (row["model_value"], row["ref_value"])
+            for row in rows if row["metric_name"] == metric
+        }
+        assert actual == {(12, 0): (100000., 100000.), (12, 1): (100200., 100000.)}
+        assert any(row["forecast_hour"] == 24 and row[metric] == 101000.
+                   for row in series)
